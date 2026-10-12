@@ -24,6 +24,7 @@ add_library(mc STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/foc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/mc_math.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/mc_current.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/mc_speed.c
     ${CMAKE_CURRENT_SOURCE_DIR}/Algorithm/pid.c
 )
 

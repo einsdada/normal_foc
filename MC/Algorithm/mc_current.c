@@ -33,11 +33,12 @@ static float VecMag(float x, float y)
 
 /* ==================== 对外接口 ==================== */
 
-void CurrentLoop_Init(CurrentLoop_t *loop, float kp, float ki, float u_max, float v2m)
+void CurrentLoop_Init(CurrentLoop_t *loop, float kp, float ki, float u_max, float i_max, float v2m)
 {
     loop->kp    = kp;
     loop->ki    = ki;
     loop->u_max = u_max;
+    loop->i_max = i_max;
     loop->v2m   = v2m;
 
     loop->ff_en = 0u;       /* 前馈默认关：参数没量准之前不开 */
@@ -73,6 +74,16 @@ void CurrentLoop_Run(CurrentLoop_t *loop, float dt,
     float ud_raw, uq_raw;               /* 限幅前的 PI + 前馈输出（调制比） */
     float mag, scale;
     uint8_t sat;
+
+    /* ---- 0. 电流给定限幅（逐轴）----
+       电流上限是**电机/驱动**的属性，所以放在内环统一把关：不管给定来自用户（电流环模式）、
+       速度环还是以后的位置环，都进不了这个门——外环各自设限迟早会漏一个。
+       为什么逐轴而不是矢量限幅：矢量限幅会改变电流矢量方向（=转矩角），对"给定"来说
+       不可预期；iq 就是转矩分量，限 iq 即限转矩，id 另限（本工程恒 0，不弱磁/不 MTPA） */
+    if (id_ref > loop->i_max)       id_ref = loop->i_max;
+    else if (id_ref < -loop->i_max) id_ref = -loop->i_max;
+    if (iq_ref > loop->i_max)       iq_ref = loop->i_max;
+    else if (iq_ref < -loop->i_max) iq_ref = -loop->i_max;
 
     /* ---- 1. 前馈解耦（可选）：把交叉耦合与反电动势一次补掉 ----
        u_d_ff = −ωe·L_q·i_q ；u_q_ff = +ωe·(L_d·i_d + ψf)   [V] → ×v2m 换成调制比 */

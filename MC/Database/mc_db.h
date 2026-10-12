@@ -22,6 +22,7 @@
 #include "current_sensor.h" /* CurrentSensor_Handle_t */
 #include "pos_sensor.h"     /* PosSensor_Handle_t */
 #include "mc_current.h"     /* CurrentLoop_t（电流环控制器） */
+#include "mc_speed.h"       /* SpeedLoop_t（速度环控制器） */
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,7 +32,8 @@ extern "C" {
 typedef enum {
     MODE_STOP = 0,               /**< 停止：关断输出 */
     MODE_CURRENT_CALIB,          /**< 校准：电流偏置校准（上电第一段） */
-    MODE_ENCODER_CALIB,          /**< 校准：编码器零点校准（A 相对齐） */
+    MODE_ENCODER_CALIB,          /**< 校准：编码器**两点锁轴**校准（同时定零点 offset 与方向 dir；
+                                      不是"对齐 A 相"，单点定不了方向 —— 见 control.c 的说明） */
     MODE_FULL_OPEN_LOOP,         /**< 全开环：电压/频率开环，无反馈 */
     MODE_HALF_OPEN_LOOP,         /**< 半开环：角度闭环（编码器反馈）、电流开环（电压直接给定） */
     MODE_CURRENT_LOOP,           /**< 电流环：Id/Iq 闭环 */
@@ -56,8 +58,13 @@ const char *mc_db_mode_name(mode_t mode);
  */
 typedef struct {
     float pos_target;   /**< 位置目标 (rad) */
-    float spd_target;   /**< 速度目标 (rpm) */
-    float iq_target;    /**< Iq 电流目标 (A) */
+    float spd_target;   /**< 速度目标 (rpm)：速度环（MODE_SPEED_CURRENT_LOOP）用 */
+    float iq_max;       /**< **用户限幅** (A)：速度/位置模式下用户指定的 Iq 给定上限
+                             （＝转矩限幅）。速度环每拍按 min(用户限幅, 保底限幅
+                             CURRENT_I_MAX_GUARD) 限幅 —— 保底限幅不可被它顶破；
+                             上电默认 = CURRENT_I_MAX_USER */
+    float iq_target;    /**< Iq 电流目标 (A)：**仅电流环模式**（MODE_CURRENT_LOOP）的用户给定；
+                             速度/位置模式下电流给定由外环写 state.iq_ref，本字段不参与 */
     float id_target;    /**< Id 电流目标 (A)；仅电流环用，半开环的 Ud 请用 ud_target */
     float ud_target;    /**< 半开环：d 轴电压给定（调制比 [-1,1]，1 = Udc/2） */
     float uq_target;    /**< 半开环：q 轴电压给定（调制比 [-1,1]，1 = Udc/2） */
@@ -68,6 +75,9 @@ typedef struct {
 /* ==================== 控制当前值 ====================
  * 写入情况（谁填的）：
  *   ol_angle / id / iq / ud / uq —— 控制环每拍写（Foc_ObserveDq / 各 Mode_xxx）
+ *   id_ref / iq_ref —— **当前生效的 dq 电流给定**（外环输出→内环给定）：
+ *        电流环模式 = target.id_target / target.iq_target（高频环每拍搬一次）；
+ *        速度/位置模式 = 速度环输出（中频环每拍写）、id_ref 恒 0
  *   其余字段标注 [预留] 的目前没人填：要用请直接读设备句柄
  *   （mc.device.pos 的 PosSensor_GetXxx / mc.device.cur 的 CurrentSensor_GetXxx），
  *   避免同一份数据两处搬运、两处不一致
@@ -80,6 +90,8 @@ typedef struct {
     float ia, ib, ic;   /**< [预留] 三相电流 (A)：用 CurrentSensor_GetIa/Ib/Ic() */
     float ol_angle;     /**< 全开环：开环电角度 (rad)，每高频拍积分 */
     float id, iq;       /**< dq 轴电流反馈 (A)：电流环/半开环/全开环观测共用 */
+    float id_ref;       /**< d 轴电流给定 (A)：送进电流环的值（已限幅），通常 0 */
+    float iq_ref;       /**< q 轴电流给定 (A)：送进电流环的值（已限幅）= 转矩指令 */
     float ud, uq;       /**< dq 轴电压（调制比 [-1,1]，1 = Udc/2；非 V） */
 } mc_state_t;
 
@@ -91,9 +103,13 @@ typedef struct {
 } mc_device_t;
 
 /* ==================== 控制环 ====================
+ * 级联：位置环（5kHz，待实现）→ 速度环（10kHz）→ 电流环（20kHz）
  * 电流环：mc_current 模块（dq PI + 前馈解耦 + 矢量限幅 + 抗饱和），
  *         增益/限幅/前馈参数都可在运行中直接改 mc.current.xxx 生效
- * 待实现：速度环、位置环（可复用 Algorithm/pid.c 的通用 PID）
+ * 速度环：mc_speed 模块（PI + 给定斜坡 + 输出限幅 → Iq 给定），
+ *         增益/限幅/斜坡可在运行中直接改 mc.speed.pid.kp/ki、mc.speed.iq_max、
+ *         mc.speed.ramp_rpm_s 生效（pid 内核见 Algorithm/pid.c）
+ * 待实现：位置环（可复用 Algorithm/pid.c，输出 → spd_target）
  */
 
 /* ==================== 调度状态（分频调度器） ==================== */
@@ -113,9 +129,12 @@ typedef struct {
     mc_enc_calib_phase_t phase;   /**< 当前阶段 */
     uint16_t             tick;    /**< LOCK：已运行拍数 */
     uint16_t             n;       /**< READ：已平均拍数 */
-    float                first;   /**< LOCK：mech 最小值（波动检测下限） */
-    float                last;    /**< LOCK：mech 最大值（波动检测上限） */
-    float                sum;     /**< READ：mech 累加（平均机械角） */
+    float                first;   /**< LOCK：**解绕后**机械角最小值（波动检测下限） */
+    float                last;    /**< LOCK：**解绕后**机械角最大值（波动检测上限） */
+    float                sum;     /**< READ：**解绕后**机械角累加（平均机械角，取平均后再归一） */
+    float                unwrapped; /**< 解绕后的连续机械角 (rad)：MT6701 原始角归一在 [0,2π)，
+                                        跨 0/2π 会跳变 2π，故按相邻增量累加成连续量；
+                                        LOCK 的 min/max 与 READ 的平均都基于它（见 control.c） */
     uint8_t              point;   /**< 锁轴点：0 = 电角度 0°（定零点），1 = 电角度 +90°（定方向） */
     uint8_t              suspect; /**< 1 = 第二点转子几乎没动/跳到远处，方向判据不可信（按 +1 兜底） */
     float                mech0;   /**< 点 0（电角度 0°）平均机械角 θmech0 (rad) */
@@ -134,6 +153,7 @@ typedef struct {
     mc_sched_t  sched;   /**< 分频调度状态（Control 三环分发使用） */
     mc_enc_calib_t enc_calib;  /**< 编码器校准状态机（两点锁轴） */
     CurrentLoop_t  current;    /**< 电流环控制器（Control_Init 初始化，运行中可直接改字段） */
+    SpeedLoop_t    speed;      /**< 速度环控制器（Control_Init 初始化，运行中可直接改字段） */
     uint8_t     enc_calib_done;  /**< 编码器校准状态：1 = 已有有效偏移+方向（本次上电校准完成）；掉电保持待开发 */
     uint8_t     calib_report;    /**< 编码器校准结果一次性打印标志：主循环打印后清 0 */
     uint8_t     oc_latched;      /**< 过流保护锁定：1 = 已触发过流（电流环），测试入口不再自动切入 */

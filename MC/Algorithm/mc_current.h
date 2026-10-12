@@ -42,7 +42,11 @@ typedef struct {
     float v2m;         /**< 伏特 → 调制比 换算系数 = 2/Udc（前馈项用） */
 
     /* ---- 输出限幅 ---- */
-    float u_max;       /**< dq 电压矢量幅值上限（调制比）：建议 ≤0.95（线性调制区 1.1547） */
+    float u_max;       /**< dq 电压矢量幅值上限（调制比）：线性调制区上限 1.1547，**但实际可用
+                            上限更低**——由低边电流采样窗口决定（见 control.h CURRENT_U_MAX）：
+                            本项目取 1.10（实测顶速 2578rpm），需配合 drv8311_cur.c 把 ADC 触发点
+                            放在计数器波峰，否则调制比 >1.04 时相电流读数会被开关沿污染 */
+    float i_max;       /**< dq 电流给定限幅（A）：id_ref/iq_ref 进环前**逐轴**限幅（额定电流） */
 
     /* ---- 前馈解耦（可选） ---- */
     uint8_t ff_en;     /**< 1 = 使能前馈解耦；参数不准时先关掉（默认关） */
@@ -61,9 +65,10 @@ typedef struct {
  * @param  kp     比例增益（调制比/A）
  * @param  ki     积分增益（调制比/(A·s)）
  * @param  u_max  电压矢量幅值上限（调制比）
+ * @param  i_max  电流给定限幅（A）：id_ref/iq_ref 逐轴限幅，保护电机与驱动
  * @param  v2m    伏特→调制比系数 = 2/Udc
  */
-void CurrentLoop_Init(CurrentLoop_t *loop, float kp, float ki, float u_max, float v2m);
+void CurrentLoop_Init(CurrentLoop_t *loop, float kp, float ki, float u_max, float i_max, float v2m);
 
 /**
  * @brief  设置前馈解耦参数（en=0 时只存参数不参与计算）
@@ -91,7 +96,8 @@ void CurrentLoop_Reset(CurrentLoop_t *loop);
  * @param  we       电角速度 (rad/s，正 = 电角度增大方向，前馈用；ff_en=0 时忽略)
  * @param  ud       输出：d 轴电压（调制比）
  * @param  uq       输出：q 轴电压（调制比）
- * @note   输出已做矢量限幅，可直接送 MC_SVPWM_Calc / 逆 Park
+ * @note   给定先逐轴限幅到 ±i_max（电流上限由内环统一把关，外环不必各自设限）；
+ *         输出已做矢量限幅，可直接送 MC_SVPWM_Calc / 逆 Park
  */
 void CurrentLoop_Run(CurrentLoop_t *loop, float dt,
                      float id_ref, float iq_ref, float id_fb, float iq_fb, float we,

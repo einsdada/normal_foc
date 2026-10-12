@@ -5,15 +5,11 @@
 #include "mc_db.h"
 
 /* ==================== 全局共享实例（单电机系统） ==================== */
+/* 只显式写 mode：其余字段由静态存储期清零（C 标准保证），
+   target/state/device/current/speed/... 的初值由 Control_Init() 填充。
+   不再逐个列出 0——那样每加一个字段都会触发 -Wmissing-field-initializers */
 MC_Handle_t mc = {
-    .mode   = MODE_STOP,
-    .target = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-    .state  = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-                0.0f, 0.0f, 0.0f, 0.0f, 0.0f },
-    .device = { 0 },            /* 设备句柄由 Control_Init() 填充初始化 */
-    .sched  = { 0u, 0u },
-    .enc_calib = { ENC_CALIB_PHASE_LOCK, 0u, 0u, 0.0f, 0.0f, 0.0f, 0u, 0u, 0.0f, 0.0f },
-    /* pid / enc_calib_done / calib_report 由 Control_Init() 填充初始化 */
+    .mode = MODE_STOP,
 };
 
 /* ==================== 模式名称（调试打印） ==================== */
