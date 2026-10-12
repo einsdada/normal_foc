@@ -46,7 +46,22 @@ typedef struct {
                                    //   电角度 = NormRad(elec_dir×机械角度×极对数 + elec_offset)）
     float            elec_offset;  // 电角度偏移（rad，编码器校准时写入）
     uint8_t          valid;        // 最新一帧是否有效
+    /* ---- 帧新鲜度诊断（识别"角度冻结"，见 PosSensor_IsStale） ---- */
+    uint32_t         frame_ok;     // 累计收到的**新**有效帧数
+    uint16_t         miss;         // 连续多少次调用没有新帧
+    uint16_t         miss_max;     // 本次上电以来 miss 的最大值（≥阈值 ⇒ 曾冻结过）
+    uint8_t          stale;        // 1 = 编码器数据已失效（角度冻结）
+    /* ---- 编码器帧自带的磁场诊断（SSI 帧 [9:6] 位，设备层解析） ----
+     这两项能直接判断"角度不动"是不是**磁铁**的问题：
+       mag_loss=1 或 mag_status≠0 ⇒ 磁铁丢失/太远/太近 ⇒ 角度输出冻结（CRC 仍正确）
+       两者都正常而角度不动 ⇒ 没有重新锁存（查 CSN/SPI 时序） */
+    uint8_t          mag_status;   // 磁场状态：0=正常 1=过强 2=过弱 3=无定义
+    uint8_t          mag_loss;     // 1 = 编码器报告失磁（loss of track）
 } PosSensor_Handle_t;
+
+/* 连续多少次"没有新帧"就判失效：本函数由中频环 10kHz 调用 ⇒ 200 次 = 20ms
+   （一帧只需 ~2.3us@10MHz，20ms 收不到一帧只能是链路断了） */
+#define POS_SENSOR_STALE_CALLS   200u
 
 /**
  * @brief  初始化位置传感器
@@ -129,5 +144,15 @@ void PosSensor_SetElecDir(PosSensor_Handle_t *handle, int8_t dir);
  * @brief  获取绝对位置（rad，含整圈，反转时为负）
  */
 float PosSensor_GetPosition(PosSensor_Handle_t *handle);
+
+/**
+ * @brief  编码器数据是否已失效（角度冻结）
+ * @param  handle  句柄
+ * @retval 1 = 连续 ≥POS_SENSOR_STALE_CALLS 次调用都没有收到新的有效帧 ⇒ 角度读数冻结；
+ *             此时"角度闭环"看到的是一个静止的转子，磁场不会旋转 ⇒ 无转矩、却一直有电流
+ * @note   控制层用它做"新鲜度看门狗"：失效时把电流给定归零；报告用它定位故障
+ *         （SSI 连续 CRC 失败、DMA 卡死、接线松动都会走到这里）
+ */
+uint8_t PosSensor_IsStale(const PosSensor_Handle_t *handle);
 
 #endif

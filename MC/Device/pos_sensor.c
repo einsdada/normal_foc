@@ -52,6 +52,12 @@ void PosSensor_Init(PosSensor_Handle_t *handle, PosSensor_Type_e type, uint16_t 
     handle->elec_dir        = 1;        /* 方向默认 +1：两点锁轴校准后按测得结果改写 */
     handle->elec_offset     = 0.0f;
     handle->valid           = 0;
+    handle->frame_ok        = 0u;
+    handle->miss            = 0u;
+    handle->miss_max        = 0u;
+    handle->stale           = 0u;
+    handle->mag_status      = 0u;
+    handle->mag_loss        = 0u;
 
     switch (type)
     {
@@ -110,10 +116,28 @@ uint8_t PosSensor_Update(PosSensor_Handle_t *handle, uint16_t freq)
     switch (handle->type)
     {
     case POS_SENSOR_SSI:
+        /* 帧新鲜度统计：TakeNewFrame 读后清零 ⇒ 能区分"新帧"与"卡住的旧帧"。
+           没有新帧就累计 miss，超阈值置 stale（角度冻结）——
+           这是"电机不转但一直有电流"的常见根因，见 PosSensor_IsStale 的说明 */
+        if (MT6701_Ssi_TakeNewFrame() != 0u)
+        {
+            handle->frame_ok++;
+            handle->miss = 0u;
+        }
+        else if (handle->miss < 0xFFFFu)
+        {
+            handle->miss++;
+            if (handle->miss > handle->miss_max) handle->miss_max = handle->miss;
+        }
+        handle->stale = (uint8_t)((handle->miss >= POS_SENSOR_STALE_CALLS) ? 1u : 0u);
+
         /* SSI：14bit 绝对角度 → 机械角（rad） */
         if (MT6701_Ssi_Process_RawData(&data))      /* BSP 层读到有效帧 */
         {
             handle->mech_angle = (float)data.angle * SSI_RAD_PER_COUNT;   /* 1 次乘法 */
+            /* 帧自带的磁场诊断：磁铁丢失/太远/太近 ⇒ 角度会冻结（而 CRC 仍正确） */
+            handle->mag_status = (uint8_t)data.field_strength;
+            handle->mag_loss   = data.loss_of_track;
             PosSensor_UpdateDerived(handle, freq);
         }
         break;
@@ -126,13 +150,20 @@ uint8_t PosSensor_Update(PosSensor_Handle_t *handle, uint16_t freq)
             handle->mech_angle = (float)m * ABZ_RAD_PER_COUNT;            /* 1 次乘法 */
             PosSensor_UpdateDerived(handle, freq);
         }
+        handle->stale = 0u;         /* ABZ 不走 SSI 帧新鲜度判据 */
         break;
 
     default:
         handle->valid       = 0;                    /* 预留类型暂无数据 */
+        handle->stale       = 0u;
         break;
     }
     return handle->valid;
+}
+
+uint8_t PosSensor_IsStale(const PosSensor_Handle_t *handle)
+{
+    return handle->stale;
 }
 
 /**

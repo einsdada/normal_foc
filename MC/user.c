@@ -39,7 +39,7 @@
  *   —— 串口接收命令后期开发（见 user_debug.h）：届时可在运行中直接改
  *      mc.target.spd_target / mc.target.iq_max，不必重新烧写
  *   以上参数的取值都写在 User_Test_Setup() 的对应分支里，改参数不用改结构 */
-#define USER_PRINT_CSV     1        /* 电流环/速度环测试需要看 Id/Iq/Ud/Uq/iq_ref → 打开 */
+#define USER_PRINT_CSV     0        /* 电流环/速度环测试需要看 Id/Iq/Ud/Uq/iq_ref → 打开 */
 #define TEST_MODE          4        /* 3 = 电流环；4 = 速度环（本次验证用） */
 #define TEST_IQ_A          0.5f     /* 电流环测试给定（A）；额定 0.5A */
 #define TEST_SPD_RPM       1000.0f  /* 速度环测试给定（rpm）：首次 1000，确认无误后再提 2000/2500 */
@@ -134,6 +134,10 @@ static void User_Test_Setup(void)
 
     if (mc.mode != MODE_STOP || !mc.device.cur.calib_done || !mc.enc_calib_done) {
         return;     /* 未就绪：不动模式（校准链自己在跑） */
+    }
+    if (mc.enc_calib.suspect != 0u) {
+        return;     /* 校准结果**可疑**（原因见 CAL 行）：不自动进测试 ——
+                       宁可停在 STOP 让人看 CAL 行，也不要拿一个坏角度去跑速度环 */
     }
     if (mc.oc_latched != 0u) {
         return;     /* 已触发过流保护：不再自动切入测试（重新上电才清） */
@@ -291,14 +295,40 @@ void User_Loop(void)
     /* 测试入口：模式与参数设置（带就绪判断，不打断上电校准链） */
     User_Test_Setup();
 
-    /* 编码器校准结果一次性上报（两点锁轴：零点 + 方向），人类可读单行，与周期 CSV 区分：
+    /* 编码器校准结果一次性上报（人类可读单行，与周期 CSV 区分）。
+       两种校准方式（control.h 的 ENC_CALIB_METHOD）打印的字段不同：
+         方式一 两点锁轴：dmech = 两点机械位移、expect = 理论位移 π/2/pp ⇒ 判方向是否可信；
+         方式二 慢速旋转：resid = 齿槽/噪声残差峰峰值、
+                         load  = 跟随负载角 δe（电角度）、
+                         rF/rR = 正/反向**跟随性比值**（同步时 ≈1.000，顺带复核极对数）、
+                         att   = 第几次尝试（>0 说明判据没过、自动重来过）
+       ⚠ 看 rF/rR 是判断"这次校准到底可不可信"的关键：失步按极对数量子化，
+         丢一步 = 比值 0.857（窗口 ±2% 会抓住它）⇒ offset 偏差可达 180° 电角度，
+         必须重烧/复位重测，不能拿去跑电机。
        dir=-1 表示编码器计数方向与电机相序相反，已在角度映射里自动纠正——
        这正是"锁轴对齐做了、半开环却不转"的原因；
-       SUSPECT 表示第二点转子几乎没走动，方向按 +1 兜底、结果不可信
-       （查锁轴电压/机械是否卡死/编码器角度是否在更新）。
+       SUSPECT 的原因由 EncCalib_FailStr 给出（align 没静止 / 没转够 / 丢步 / 负载角），
+       对应排查：校准电压够不够、机械是否卡、编码器是否在更新。
        串口忙则本轮不清标志、下一轮重试，避免与周期打印撞车丢消息 */
     if (mc.calib_report)
     {
+#if (ENC_CALIB_METHOD == ENC_CALIB_METHOD_ROT)
+        if (uart_printf("CAL: off=%.4f dir=%+d [ROT] resid=%.2fdeg load=%.2fdeg "
+                        "rF=%.3f rR=%.3f att=%u first=%s emax=%u %s\n",
+                        mc.device.pos.elec_offset,
+                        (int)mc.device.pos.elec_dir,
+                        mc.enc_calib.rot_resid * 57.29578f,                             /* rad→deg */
+                        mc.enc_calib.rot_load * 57.29578f,                             /* rad→deg */
+                        mc.enc_calib.rot_ratio_fwd,
+                        mc.enc_calib.rot_ratio_rev,
+                        (unsigned)mc.enc_calib.rot_attempt,
+                        EncCalib_FailCode(mc.enc_calib.rot_fail_first),  /* 首次为何重试 */
+                        (unsigned)mc.device.pos.miss_max,   /* emax：编码器最长断帧（≥200 ⇒ 冻结过） */
+                        EncCalib_FailStr(&mc.enc_calib)))
+        {
+            mc.calib_report = 0u;
+        }
+#else
         if (uart_printf("CAL: off=%.4f dir=%+d dmech=%.4f expect=%.4f %s\n",
                         mc.device.pos.elec_offset,
                         (int)mc.device.pos.elec_dir,
@@ -309,6 +339,7 @@ void User_Loop(void)
         {
             mc.calib_report = 0u;
         }
+#endif
     }
 
     /* 本次测试配置一次性上报：确认烧进去的到底是哪套参数（改宏后忘了重新下载时一眼可见）。
@@ -360,7 +391,86 @@ void User_Loop(void)
                 fault_latched = 1u;
             }
         } else {
-            fault_latched = 0u;
+            /* 故障**消失**也报一次，并带上"持续了多久、一共几次"：
+                 短促一闪（几 ms）+ 次数多 ⇒ 电源跌落/接插件接触/干扰
+                 较长（几十~几百 ms）+ 次数少 ⇒ 过流/过温自动重试
+               这两类排查方向不同，所以这两个数字比"发生过故障"本身更有用 */
+            if (fault_latched != 0u &&
+                uart_printf("FAULT: DRV8311 nFAULT cleared (recovered) - was low %ums, %u times "
+                            "-> check VM sag / OCP / OTSD\n",
+                            (unsigned)(mc.drv_fault_ticks / 20u),   /* 20kHz ⇒ 20 拍 = 1ms */
+                            (unsigned)mc.drv_fault_cnt)) {
+                fault_latched = 0u;
+            }
+        }
+    }
+
+    /* 编码器数据冻结一次性上报：这是"电机不转、但一直有功率"的头号嫌疑
+       （角度不更新 ⇒ 磁场不转 ⇒ 有电流没转矩）。判据：连续 >20ms 收不到新的有效帧。
+       出现它就要查链路本身：SSI 接线/时钟、CRC 连续失败、DMA 卡死、编码器供电。
+       miss_max = 本次上电以来"连续无新帧"的最大值（直接反映断了多久，10000 ≈ 1s）；
+       ok = 累计收到的有效帧数（正常在 10kHz 下一路增长，冻结时停住） */
+    {
+        static uint8_t enc_stale_latched = 0u;
+
+        if (PosSensor_IsStale(&mc.device.pos) != 0u) {
+            if (enc_stale_latched == 0u &&
+                uart_printf("FAULT: encoder stale (no valid frame >20ms, miss_max=%u, ok=%u) "
+                            "- check MISO(PC11)/SCK(PC10)/CSN(PA15) & magnet\n",
+                            (unsigned)mc.device.pos.miss_max,
+                            (unsigned)mc.device.pos.frame_ok)) {
+                enc_stale_latched = 1u;
+            }
+        } else {
+            enc_stale_latched = 0u;
+        }
+    }
+
+    /* 编码器磁场诊断（边上报，不污染周期 CSV 流）：MT6701 帧里自带"磁场状态 + 失磁标志"，
+       以前驱动只取角度、把这两项丢了。**这是判断"角度读数冻结"根因的最直接证据**：
+         · status≠0（过强/过弱）或 loss=1 ⇒ 磁铁丢了/离太远/太近 ⇒ 角度输出会冻结（CRC 仍正确）
+         · 两项都正常而角度仍不跟着轴动 ⇒ 没有重新锁存 ⇒ 查 CSN/SPI 时序与接线
+       变化时（含上电首次）打印一行；手转电机轴时若这行出现变化，就是磁铁/机械的问题 */
+    {
+        static uint8_t mag_last = 0xFFu;
+        uint8_t mag_now = (uint8_t)((mc.device.pos.mag_loss << 2) | (mc.device.pos.mag_status & 0x3u));
+
+        /* 只有**真正收到过有效帧**时这两位才有意义（恒 0 的帧已被 BSP 显式拒绝，
+           否则它的 status/loss 也是 0，会被误读成"磁场正常"）。
+           判读：status/loss 有异常 ⇒ 磁铁（丢失/太远/太近）；
+                 两者都正常而角度不跟着轴动 ⇒ 通信/锁存（查 MISO-PC11/SCK-PC10/CSN-PA15） */
+        if ((mag_now != mag_last) && (mc.device.pos.frame_ok != 0u)) {
+            if (uart_printf("MAG: status=%u loss=%u frames=%u (0=磁场正常; !=0 ⇒ 磁铁异常)\n",
+                            (unsigned)mc.device.pos.mag_status,
+                            (unsigned)mc.device.pos.mag_loss,
+                            (unsigned)mc.device.pos.frame_ok)) {
+                mag_last = mag_now;
+            }
+        }
+    }
+
+    /* "编码器活着、但读数冻结"专用提示（一次性）：
+       帧一直在收（不 stale、也不是全 0，BSP 已拒绝全 0）却始终没有位置变化 ⇒
+       既不是驱动问题也不是失步，而是**位置反馈本身是死的**。这类故障最坑：
+       所有其他判据看起来都"正常"，只有"转子转了而读数不动"才能发现它。
+       两根线索：轴上磁铁是否随轴转 / CSN(PA15) 是否被拉死（芯片不重新锁存 ⇒ 老帧照发） */
+    {
+        static uint8_t frozen_latched = 0u;
+        uint8_t frozen = (uint8_t)((mc.enc_calib.done != 0u) &&
+                                   (mc.enc_calib.suspect != 0u) &&
+                                   (mc.enc_calib.rot_ratio_fwd < 0.05f) &&
+                                   (mc.enc_calib.rot_ratio_rev < 0.05f) &&
+                                   (PosSensor_IsStale(&mc.device.pos) == 0u));
+
+        if (frozen != 0u) {
+            if (frozen_latched == 0u &&
+                uart_printf("FAULT: encoder data flows but the angle NEVER changes (rF=rR≈0, not stale)\n"
+                            "       -> the position feedback itself is dead: check the magnet on the\n"
+                            "          shaft (must rotate with it) and CSN(PA15) (stuck low = old frame))\n")) {
+                frozen_latched = 1u;
+            }
+        } else {
+            frozen_latched = 0u;
         }
     }
 

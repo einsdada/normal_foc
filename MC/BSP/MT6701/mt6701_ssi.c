@@ -16,9 +16,11 @@ static uint8_t rx_buf[3];
 
 /* DMA 读取状态 */
 static volatile uint16_t enc_angle = 0;   /* 最近一次 CRC 校验通过的角度 */
+static volatile uint32_t enc_raw   = 0;   /* 最近一帧 CRC 通过的**原始 24bit**（含磁场状态位，诊断用） */
 static volatile uint8_t  enc_valid = 0;   /* 是否已经读到过有效帧 */
 static volatile uint8_t  enc_busy  = 0;   /* DMA 是否正在搬运 */
 static uint16_t          enc_busy_cnt = 0;/* 连续 busy 次数（卡死兜底计时） */
+static volatile uint8_t  enc_new_frame = 0; /* 有"新"有效帧待取走（TakeNewFrame 读后清零） */
 
 
 void MT6701_Ssi_Init(void)
@@ -27,10 +29,23 @@ void MT6701_Ssi_Init(void)
     MT6701_SSI_MODE_PORT->BSRR = (uint32_t)MT6701_SSI_MODE_PIN;
     SSI_CSN_HIGH();
 
-    enc_angle    = 0;
-    enc_valid    = 0;
-    enc_busy     = 0;
-    enc_busy_cnt = 0;
+    enc_angle     = 0;
+    enc_raw       = 0;
+    enc_valid     = 0;
+    enc_busy      = 0;
+    enc_busy_cnt  = 0;
+    enc_new_frame = 0;
+}
+
+
+uint8_t MT6701_Ssi_TakeNewFrame(void)
+{
+    if (enc_new_frame != 0u)
+    {
+        enc_new_frame = 0u;
+        return 1u;
+    }
+    return 0u;
 }
 
 
@@ -97,10 +112,27 @@ void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
                      ((uint32_t)rx_buf[1] << 8)  |
                      (uint32_t)rx_buf[2];
 
+    /* ⚠⚠ 全 0 帧必须**显式拒绝** —— 这是本驱动最容易骗过自己的地方：
+       CRC-6（LFSR 初值 0）对全 0 输入的输出就是 0，所以 raw24 == 0 时
+       (raw24 & 0x3F) == CalcCRC(0) == 0 **校验会通过**！
+       一旦 MISO(PC11) 断线/虚焊/编码器没驱动，收到的永远是 0x000000：
+         · 固件把"恒为 0 的角度"当成有效帧 ⇒ 角度读数与轴的转动彻底脱钩
+         · 帧却一直"有效"（新帧计数照涨）⇒ 新鲜度看门狗也不会报
+         · 现象：校准 dm=0、闭环角度不更新、电机不转但一直有电流
+       全 1 帧同理挡掉（它的 CRC 字段对不上，本就来通不过，写明更清楚）。
+       拒绝后不置 enc_new_frame ⇒ 设备层的 miss 计数会涨 ⇒ 20ms 后判"编码器失效"
+       并打出 FAULT: encoder stale —— 把静默故障变成明确报警 */
+    if ((raw24 == 0u) || (raw24 == 0xFFFFFFu))
+    {
+        return;
+    }
+
     if ((raw24 & 0x3F) == CalcCRC((raw24 >> 6) & 0x3FFFF))
     {
-        enc_angle = (raw24 >> 10) & 0x3FFF;     // 校验通过才更新
-        enc_valid = 1;
+        enc_angle     = (raw24 >> 10) & 0x3FFF;     // 校验通过才更新
+        enc_raw       = raw24;                      // 整帧留一份：磁场状态/失磁位在 [9:6]
+        enc_valid     = 1;
+        enc_new_frame = 1;                          // 标记"有新帧"（设备层统计新鲜度用）
     }
 }
 
@@ -138,6 +170,14 @@ uint8_t MT6701_Ssi_Process_RawData(Encoder_RawData_t *data)
     // 2. 返回上一帧的结果（第一次调用时还没有数据，返回 0）
     if (!enc_valid) return 0;
 
-    data->angle = enc_angle;
+    /* 整帧解析：18 位数据 = [23:10] 角度(14) + [9:8] 磁场状态 + [7] 按键 + [6] 失磁标志，
+       [5:0] 是 CRC-6（见 CalcCRC 的校验式）。原来只取了角度，把**磁场状态与失磁标志
+       整块丢掉了** —— 而"角度读数冻结但帧仍有效"恰恰要靠这两项来判断：
+         · 磁铁掉了/离太远 ⇒ 磁场状态异常 + loss_of_track=1 ⇒ 角度输出冻结（CRC 仍正确）
+         · 若这两项都正常而角度不动 ⇒ 说明没有重新锁存（查 CSN/SPI 时序） */
+    data->angle          = enc_angle;
+    data->field_strength = (Magnet_FieldStatus_e)((enc_raw >> 8) & 0x3u);
+    data->push_button    = (uint8_t)((enc_raw >> 7) & 0x1u);
+    data->loss_of_track  = (uint8_t)((enc_raw >> 6) & 0x1u);
     return 1;
 }

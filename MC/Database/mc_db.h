@@ -23,6 +23,7 @@
 #include "pos_sensor.h"     /* PosSensor_Handle_t */
 #include "mc_current.h"     /* CurrentLoop_t（电流环控制器） */
 #include "mc_speed.h"       /* SpeedLoop_t（速度环控制器） */
+#include "mc_enc_calib.h"   /* EncCalib_t（编码器校准：两点锁轴 / 慢速旋转） */
 
 #ifdef __cplusplus
 extern "C" {
@@ -118,29 +119,6 @@ typedef struct {
     uint16_t low_cnt;    /**< 低频环分频计数（4 分频 = 5kHz） */
 } mc_sched_t;
 
-/* ==================== 编码器校准（两点锁轴法，状态机） ==================== */
-typedef enum {
-    ENC_CALIB_PHASE_LOCK   = 0,   /**< 锁轴：固定直流矢量锁转子（点 0 = 电角度 0°，点 1 = 电角度 +90°），等振动收敛 */
-    ENC_CALIB_PHASE_READ   = 1,   /**< 读数：位置稳定后多拍平均机械角 → 定零点（点 0）/ 定方向（点 1） */
-    ENC_CALIB_PHASE_FINISH = 2,   /**< 收尾：关断回停止 */
-} mc_enc_calib_phase_t;
-
-typedef struct {
-    mc_enc_calib_phase_t phase;   /**< 当前阶段 */
-    uint16_t             tick;    /**< LOCK：已运行拍数 */
-    uint16_t             n;       /**< READ：已平均拍数 */
-    float                first;   /**< LOCK：**解绕后**机械角最小值（波动检测下限） */
-    float                last;    /**< LOCK：**解绕后**机械角最大值（波动检测上限） */
-    float                sum;     /**< READ：**解绕后**机械角累加（平均机械角，取平均后再归一） */
-    float                unwrapped; /**< 解绕后的连续机械角 (rad)：MT6701 原始角归一在 [0,2π)，
-                                        跨 0/2π 会跳变 2π，故按相邻增量累加成连续量；
-                                        LOCK 的 min/max 与 READ 的平均都基于它（见 control.c） */
-    uint8_t              point;   /**< 锁轴点：0 = 电角度 0°（定零点），1 = 电角度 +90°（定方向） */
-    uint8_t              suspect; /**< 1 = 第二点转子几乎没动/跳到远处，方向判据不可信（按 +1 兜底） */
-    float                mech0;   /**< 点 0（电角度 0°）平均机械角 θmech0 (rad) */
-    float                dmech;   /**< 两点机械角差 (rad)：名义 ±π/(2×极对数)，校准诊断用 */
-} mc_enc_calib_t;
-
 /* ==================== 控制数据库（统一封装） ==================== */
 /**
  * @brief 电机控制数据库结构：模式 + 目标值 + 当前值 + 设备句柄 + 调度状态 统一封装
@@ -151,7 +129,7 @@ typedef struct {
     mc_state_t  state;   /**< 控制当前值 */
     mc_device_t device;  /**< 运行设备句柄（PWM/电流/位置，Control_Init 初始化） */
     mc_sched_t  sched;   /**< 分频调度状态（Control 三环分发使用） */
-    mc_enc_calib_t enc_calib;  /**< 编码器校准状态机（两点锁轴） */
+    EncCalib_t  enc_calib;  /**< 编码器校准算法句柄（状态机+诊断量；算法在 Algorithm/mc_enc_calib.c） */
     CurrentLoop_t  current;    /**< 电流环控制器（Control_Init 初始化，运行中可直接改字段） */
     SpeedLoop_t    speed;      /**< 速度环控制器（Control_Init 初始化，运行中可直接改字段） */
     uint8_t     enc_calib_done;  /**< 编码器校准状态：1 = 已有有效偏移+方向（本次上电校准完成）；掉电保持待开发 */
@@ -159,6 +137,13 @@ typedef struct {
     uint8_t     oc_latched;      /**< 过流保护锁定：1 = 已触发过流（电流环），测试入口不再自动切入 */
     uint8_t     fault_report;    /**< 故障一次性打印标志：主循环打印后清 0 */
     uint16_t    oc_cnt;          /**< 过流连续超阈值计数（未超时清零） */
+
+    /* ---- 驱动器故障（nFAULT）诊断：Control 层填，供上报 ----
+     * 用途：区分"常驻故障"（一直不恢复 ⇒ 查硬件）与"间歇故障"（拉了又放 ⇒ 优先怀疑
+     * 供电跌落/接插件接触/过流重试），并给出故障持续了多久 —— 这两者排查方向不同 */
+    uint16_t    drv_fault_ticks; /**< 本次上电累计 nFAULT 拉低的拍数（20kHz ⇒ 20000 = 1s；饱和 65535） */
+    uint16_t    drv_fault_cnt;   /**< nFAULT 拉低次数 */
+    uint8_t     drv_fault_seen;  /**< 内部边沿标志：故障期间还没做过"复位校准" */
 } MC_Handle_t;
 
 /* 全局共享实例（单电机系统） */

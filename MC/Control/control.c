@@ -11,6 +11,9 @@
  *                          Mode_Stop / Mode_CurrentCalib / Mode_EncoderCalib /
  *                          Mode_FullOpenLoop / Mode_HalfOpenLoop / Mode_CurrentLoop
  *                          （Mode_SpeedCurrentLoop 在中频环执行，见第 3 节末尾）
+ *                          编码器校准的**算法**在 Algorithm/mc_enc_calib.c（两种方式：
+ *                          两点锁轴 / 慢速旋转，由 control.h 的 ENC_CALIB_METHOD 选），
+ *                          本文件的 Mode_EncoderCalib 只是"读角度→调算法→写设备"的胶水
  *   4. 对外接口        —— Control_Init / Control_Sched / Control_HighLoop
  *                          / Control_MidLoop / Control_LowLoop
  *
@@ -31,11 +34,56 @@
 #include "mc_speed.h"    /* SpeedLoop_Run / Reset（速度环 → Iq 给定） */
 
 /* ==================== 1. 实现常量 ====================
- * 可调参数（锁轴电压/稳定判据/方向判据/PI 初值）统一放在 control.h，此处只留
- * 本文件内部用的数学常量（不对外暴露通用名 FOC_2PI/FOC_PI，避免与 foc.h/mc_math.h 撞名） */
+ * 可调参数（校准方式/锁轴电压/稳定判据/方向判据/PI 初值）统一放在 control.h，此处只留
+ * 本文件内部用的数学常量，以及"把 control.h 的宏折成算法层参数"这一步折算
+ * （不对外暴露通用名 FOC_2PI/FOC_PI，避免与 foc.h/mc_math.h 撞名） */
 #define FOC_2PI    6.283185307179586f   /* 2π：开环电角度积分步长换算 */
-#define FOC_PI     3.141592653589793f   /* π：角度解绕判据 */
-#define FOC_HALF_PI (FOC_PI * 0.5f)     /* π/2：两点锁轴第二点的电角度（定方向用） */
+#define FOC_PI     3.141592653589793f   /* π：校准判据阈值的角度→弧度换算 */
+
+/* ---- 编码器校准算法参数：control.h 的"人读"宏 → mc_enc_calib 要的形式 ----
+ * 时间类参数在这里就折成拍数（算法里只数拍，省掉运行期乘除），角度阈值统一换成 rad。
+ * 全部是编译期常量 ⇒ 直接塞进 static const 结构体；算法层因此不必认识 control.h 的宏名，
+ * 也就保持了"Algorithm 不依赖 Control"的分层（与 mc_current/mc_speed 通过入参拿参数同理） */
+#define ENC_ROT_RAMP_TICKS      ((uint16_t)(ENC_ROT_RAMP_S        * (float)CONTROL_HIGH_HZ))
+#define ENC_ROT_SETTLE_TICKS    ((uint16_t)(ENC_ROT_SETTLE_S      * (float)CONTROL_HIGH_HZ))
+#define ENC_ROT_ALIGN_MIN_TICKS ((uint16_t)(ENC_ROT_ALIGN_MIN_S   * (float)CONTROL_HIGH_HZ))
+#define ENC_ROT_ALIGN_MAX_TICKS ((uint16_t)(ENC_ROT_ALIGN_MAX_S   * (float)CONTROL_HIGH_HZ))
+#define ENC_ROT_WIN_TICKS       ((uint16_t)(ENC_ROT_WIN_S         * (float)CONTROL_HIGH_HZ))
+#define ENC_ROT_MAX_MEAS_TICKS  ((uint16_t)(ENC_ROT_MAX_MEAS_S    * (float)CONTROL_HIGH_HZ))
+#define DRV_FAULT_WAIT_TICKS    ((uint16_t)(DRV_FAULT_WAIT_S      * (float)CONTROL_HIGH_HZ))
+/* 每个测量段要走够的电角度：REVS 个机械圈 × 极对数 × 2π */
+#define ENC_ROT_TRAVEL_TARGET  (FOC_2PI * (float)MOTOR_POLE_PAIRS * ENC_ROT_REVS)
+#define ENC_ROT_MAX_LOAD_RAD   (ENC_ROT_MAX_LOAD_DEG * (FOC_PI / 180.0f))
+
+static const EncCalib_Cfg_t g_enc_calib_cfg = {
+    .method        = ENC_CALIB_METHOD,
+    .dir_force     = (int8_t)ENC_CALIB_DIR_FORCE,
+    .pole_pairs    = (uint16_t)MOTOR_POLE_PAIRS,
+
+    /* 方式一 两点锁轴 */
+    .lock_volt     = ENC_CALIB_LOCK_VOLT,
+    .min_settle    = (uint16_t)ENC_CALIB_MIN_SETTLE,
+    .max_settle    = (uint16_t)ENC_CALIB_MAX_SETTLE,
+    .read_n        = (uint16_t)ENC_CALIB_READ_N,
+    .stable_err    = ENC_CALIB_STABLE_ERR,
+    .dir_min_ratio = ENC_CALIB_DIR_MIN_RATIO,
+    .dir_max_ratio = ENC_CALIB_DIR_MAX_RATIO,
+
+    /* 方式二 慢速旋转 */
+    .rot_volt            = ENC_ROT_VOLT,
+    .rot_freq            = ENC_ROT_FREQ_HZ,
+    .rot_ramp_ticks      = ENC_ROT_RAMP_TICKS,
+    .rot_settle_ticks    = ENC_ROT_SETTLE_TICKS,
+    .rot_align_min_ticks = ENC_ROT_ALIGN_MIN_TICKS,
+    .rot_align_max_ticks = ENC_ROT_ALIGN_MAX_TICKS,
+    .rot_win_ticks       = ENC_ROT_WIN_TICKS,
+    .rot_max_meas_ticks  = ENC_ROT_MAX_MEAS_TICKS,
+    .rot_travel_target   = ENC_ROT_TRAVEL_TARGET,
+    .rot_ratio_min       = ENC_ROT_RATIO_MIN,
+    .rot_ratio_max       = ENC_ROT_RATIO_MAX,
+    .rot_max_load        = ENC_ROT_MAX_LOAD_RAD,
+    .rot_retry_n         = (uint8_t)ENC_ROT_RETRY_N
+};
 
 /* ==================== 2. 内部工具 ==================== */
 
@@ -74,38 +122,8 @@ static void Foc_GetSinCos(MC_Handle_t *handle, float we, float *s, float *c)
     MC_Math_SinCos(ang, s, c);      /* 一次算 sin/cos（省一次角度归一化，原 60 条 → ~35 条） */
 }
 
-/**
- * @brief  角度取模到 [0, 2π)
- * @note   与 pos_sensor.c 内的同名静态函数同理：取模用乘倒数，无除法。
- *         本文件用到两处：锁轴读数的解绕平均值、锁轴偏移的归一
- */
-static float Foc_NormRad(float rad)
-{
-    rad -= (float)(int)(rad * (1.0f / FOC_2PI)) * FOC_2PI;
-    if (rad < 0.0f) {
-        rad += FOC_2PI;
-    }
-    return rad;
-}
-
-/**
- * @brief  编码器校准状态机复位：回到第一个锁轴点（电角度 0°）
- * @note   进入校准模式、收尾阶段都调用；同时清掉方向判据的中间量
- */
-static void EncCalib_Reset(MC_Handle_t *handle)
-{
-    handle->enc_calib.phase     = ENC_CALIB_PHASE_LOCK;
-    handle->enc_calib.tick      = 0u;
-    handle->enc_calib.n         = 0u;
-    handle->enc_calib.sum       = 0.0f;
-    handle->enc_calib.point     = 0u;
-    handle->enc_calib.suspect   = 0u;
-    handle->enc_calib.mech0     = 0.0f;
-    handle->enc_calib.dmech     = 0.0f;
-    handle->enc_calib.unwrapped = 0.0f;     /* 解绕量：tick==0 的首拍会按当前角重新播种 */
-    handle->enc_calib.first     = 0.0f;
-    handle->enc_calib.last      = 0.0f;
-}
+/* 注：编码器校准的解绕、角度归一与两套状态机都已搬到 Algorithm/mc_enc_calib.c（算法层），
+   本文件只留"读角度 → 调算法 → 写设备/落库"的胶水，见第 3 节的 Mode_EncoderCalib */
 
 /* ==================== 3. 各模式处理（高频环 20kHz 每拍） ==================== */
 
@@ -133,188 +151,107 @@ static void Mode_CurrentCalib(MC_Handle_t *handle)
 
     if (handle->device.cur.calib_done)
     {
-        EncCalib_Reset(handle);     /* 编码器校准状态机复位到第一个锁轴点 */
+        EncCalib_Reset(&handle->enc_calib);     /* 校准状态机复位到整段最开头（算法层） */
         handle->mode = handle->enc_calib_done ? MODE_STOP : MODE_ENCODER_CALIB;
     }
 }
 
 /**
- * @brief  编码器校准（两点锁轴法，阶段状态机）：同时定"零点"和"方向"
- *
- *   点 0：矢量锁在电角度 0°（Uα=U，即 A 相磁轴）→ 转子 d 轴对齐 α 轴
- *         → 等振动收敛 → 平均机械角 θmech0（50ms）
- *   点 1：矢量锁在电角度 +90°（Uβ=U）  → 转子 d 轴对齐 β 轴（再走 90° 电角度，
- *         机械只走 1/(4×极对数) 圈 ≈ 12.9°，不会产生 ±180° 包绕歧义）
- *         → 平均机械角 θmech1
- *
- *   两点联立（θe = dir×极对数×θmech + offset）：
- *     0   = dir×pp×θmech0 + offset
- *     π/2 = dir×pp×θmech1 + offset
- *   ⇒ dir    = sign(θmech1 − θmech0)   （机械角随电角度增大 = +1，反向 = −1）
- *     offset = NormRad(−dir×pp×θmech0)
- *
- * @note   单点锁轴只能定零点，"转起来"靠的是 dθe/dθmech 的**方向**：方向反时
- *         角度闭环（半开环/电流环）变正反馈——矢量相对转子倒转、转矩角立刻反向
- *         → 平均转矩 0 → 电机原地不转（只抖不动、电流全在 d 轴上），且与电压大小无关。
- *         故必须用第二点把方向测出来（方向参数在 control.h）。
- *         FINISH 关断回停止（enc_calib_done=1 + 置一次性打印标志）。
+ * @brief  编码器校准（模式处理）：读机械角 → 跑 Algorithm 的校准算法 → 写设备/落库
+ * @note   算法本体（两套状态机、解绕、方向判据、阈值判据）在 Algorithm/mc_enc_calib.c；
+ *         本函数只做三件事，写法与 Mode_HalfOpenLoop 一致：
+ *           1) 把 PosSensor 的**原始**机械角与本拍 dt 交给 EncCalib_Run；
+ *           2) 未完成 → 使能驱动器 + 把算法给的 dq 矢量经 SVPWM 写进 PWM；
+ *           3) 完成 → 结果写回 pos 句柄（**方向必须先于偏移生效**）、关断、
+ *              置一次性上报标志、回停止
+ *         参数由本文件顶部的 g_enc_calib_cfg 折算而来，control.h 仍是唯一的调参处
  */
 static void Mode_EncoderCalib(MC_Handle_t *handle)
 {
+    EncCalib_Out_t out;
     float u, v, w;
 
-    MotorPwm_EnsureEnabled(&handle->device.pwm);    /* 从停止切入：一次性使能 */
+    /* ---- 驱动器故障（nFAULT 拉低）：输出级被芯片自己关断 ⇒ 没电流就没转矩 ----
+       硬跑校准毫无意义（转子纹丝不动 ⇒ dm=0 ⇒ 被误判成丢步、白跑重试），
+       但也不能一故障就永久放弃（可能是暂态：电源跌落/干扰/过流自动重试）。
+       策略：故障期间只等待、不推进校准；恢复后复位重来；累计太久才放弃。
 
-    /* ---- 机械角解绕（LOCK/READ 两阶段共用，每拍一次）----
-       MT6701 给出的机械角归一在 [0, 2π)，转子经过 0/2π 边界时会跳变 2π。
-       直接对原始角做 min/max 或求平均都会出错：
-         · LOCK："波动 < 0.1°" 判据在轨迹跨过边界时算出 ~2π 的假波动 → 早退永远
-           不成立、白等到 1s 超时（上电变慢，且"先收敛再判稳定"的保证被绕过）；
-         · READ：锁轴点恰好落在边界附近时，1000 拍的平均值会算成 ≈π 的错误角
-           → θmech0/θmech1 全错 → offset 报废（静默的坏校准）。
-       这里按"相邻两拍增量"累加成连续量 unwrapped：因 unwrapped ≡ mech (mod 2π)，
-       直接对它做 (mech − unwrapped) 解绕即可得真实小增量，无需另存上一拍原始角 */
+       ⚠⚠ 等待期间**只清占空比，绝不能调用 MotorPwm_Stop()**：
+         Stop 的语义是"清零 + 关断驱动器（nSLEEP 拉低）"，而 nSLEEP 低时芯片进 sleep、
+         nFAULT 变成高阻被上拉拉高 ⇒ 会被误读成"故障恢复了"；接着下一拍 EnsureEnabled
+         又把 nSLEEP 拉高、真实故障条件仍在 ⇒ nFAULT 再拉低……
+         结果是每拍在"关断→假恢复→使能→再故障"之间自激打转：驱动器几乎不出力（转子
+         不动、校准照旧失败），而且**每使能一次就重新触发一次故障**，把故障"养"住。
+         保持使能 + 0% 占空比（三相下桥全通 = 绕组短路 = 安全态），芯片自己的重试才有机会恢复。
+
+       ⚠ 每拍查一次 GPIO（开销可忽略）：故障可能在校准途中才出现 */
+    if (MotorPwm_FaultRead(&handle->device.pwm) != 0u)
     {
-        float mech = PosSensor_GetMechAngle(&handle->device.pos);   /* 原始机械角（校准专用） */
+        MotorPwm_SetDuty(&handle->device.pwm, 0.0f, 0.0f, 0.0f);    /* 只清零，不动 nSLEEP */
 
-        if (handle->enc_calib.tick == 0u)
-        {
-            handle->enc_calib.unwrapped = mech;     /* 每段锁轴的首拍：以当前角为起点 */
-            handle->enc_calib.first     = mech;     /* min 初值（解绕值） */
-            handle->enc_calib.last      = mech;     /* max 初值（解绕值） */
-        }
-        else
-        {
-            float d = mech - handle->enc_calib.unwrapped;
-
-            if (d > FOC_PI)        d -= FOC_2PI;    /* 解绕到 (−π, π] */
-            else if (d <= -FOC_PI) d += FOC_2PI;
-
-            handle->enc_calib.unwrapped += d;
-
-            if (handle->enc_calib.unwrapped < handle->enc_calib.first) {
-                handle->enc_calib.first = handle->enc_calib.unwrapped;
-            }
-            if (handle->enc_calib.unwrapped > handle->enc_calib.last) {
-                handle->enc_calib.last = handle->enc_calib.unwrapped;
+        if (handle->drv_fault_seen == 0u) {
+            handle->drv_fault_seen = 1u;            /* 边沿：记一次故障次数 */
+            if (handle->drv_fault_cnt < 0xFFFFu) {
+                handle->drv_fault_cnt++;
             }
         }
-        handle->enc_calib.tick++;
+        if (handle->drv_fault_ticks < 0xFFFFu) {
+            handle->drv_fault_ticks++;              /* 累计时长（跨多次间歇故障累加） */
+        }
+
+        if (handle->drv_fault_ticks >= DRV_FAULT_WAIT_TICKS)
+        {
+            /* 等够久了还不恢复：收尾（CAL 行报 driver-fault，系统停在 STOP 等人工处理） */
+            EncCalib_Abort(&handle->enc_calib, ENC_FAIL_DRV);
+            handle->calib_report = 1u;
+            handle->mode = MODE_STOP;
+        }
+        return;                                     /* 故障期间不推进校准、不输出电压 */
     }
 
-    switch (handle->enc_calib.phase)
+    if (handle->drv_fault_seen != 0u)
     {
-    case ENC_CALIB_PHASE_LOCK:      /* ---- 锁轴：固定矢量锁转子 + 等稳定 ---- */
-        if (handle->enc_calib.point == 0u) {
-            MC_SVPWM_Calc(ENC_CALIB_LOCK_VOLT, 0.0f, 0.0f, 1.0f, &u, &v, &w);  /* 点 0：Uα=U, Uβ=0（电角度 0°） */
-        } else {
-            MC_SVPWM_Calc(0.0f, ENC_CALIB_LOCK_VOLT, 0.0f, 1.0f, &u, &v, &w);  /* 点 1：Uα=0, Uβ=U（电角度 +90°） */
-        }
-        MotorPwm_SetDuty(&handle->device.pwm, u, v, w);
-        /* tick / first / last 已在函数开头的解绕块里更新 */
+        /* 故障消失：从整段开头重来（故障期间转子可能被动过，之前的相位参照已不可信） */
+        handle->drv_fault_seen = 0u;
+        EncCalib_Reset(&handle->enc_calib);
+    }
 
-        /* 稳定判据：最小等待已过 && 位置波动 < 0.1° 机械；超时强制进读数
-           @note 该判据只看"位置是否不再动"，编码器失效/转子被卡住时同样成立
-                 （此时角度无声失效）——故点 1 之后还要用位移符号判方向，
-                 位移不足则置 suspect 交主循环打印，避免"校准成功但角度是坏的" */
-        if ((handle->enc_calib.tick >= ENC_CALIB_MIN_SETTLE &&
-             (handle->enc_calib.last - handle->enc_calib.first) < ENC_CALIB_STABLE_ERR) ||
-            handle->enc_calib.tick >= ENC_CALIB_MAX_SETTLE)
-        {
-            handle->enc_calib.phase = ENC_CALIB_PHASE_READ;
-            handle->enc_calib.n     = 0u;
-            handle->enc_calib.sum   = 0.0f;
-        }
-        break;
-
-    case ENC_CALIB_PHASE_READ:      /* ---- 读数：多拍平均机械角 → 点 0 定零点 / 点 1 定方向 ---- */
-        /* 继续锁轴，累加**解绕后**的机械角（跨 0/2π 边界也不会算错），最后再归一回 [0,2π) */
-        handle->enc_calib.sum += handle->enc_calib.unwrapped;
-        if (++handle->enc_calib.n >= ENC_CALIB_READ_N)
-        {
-            float mech_avg = Foc_NormRad(handle->enc_calib.sum / (float)ENC_CALIB_READ_N);
-
-            if (handle->enc_calib.point == 0u)
-            {
-                /* 点 0（真实电角度 0°）：记下 θmech0，转子再锁到电角度 +90° 一点 */
-                handle->enc_calib.mech0 = mech_avg;
-                handle->enc_calib.point = 1u;
-                handle->enc_calib.phase = ENC_CALIB_PHASE_LOCK;
-                handle->enc_calib.tick  = 0u;
-                handle->enc_calib.n     = 0u;
-                handle->enc_calib.sum   = 0.0f;
-            }
-            else
-            {
-                /* 点 1（真实电角度 +90°）：由两点位移定方向，再由点 0 定偏移 */
-                float  dm     = mech_avg - handle->enc_calib.mech0;     /* 名义 ±π/(2×pp) */
-                float  expect = FOC_HALF_PI / (float)MOTOR_POLE_PAIRS;  /* 理论机械位移 */
-                float  admech;
-                int8_t dir;
-                float  off;
-
-                /* 两个机械角各自在 [0, 2π)，差值可能跨过 0/2π 边界 → 解绕到 (−π, π] */
-                if (dm > FOC_PI)       dm -= FOC_2PI;
-                else if (dm <= -FOC_PI) dm += FOC_2PI;
-
-                admech = (dm < 0.0f) ? -dm : dm;
-                handle->enc_calib.dmech = dm;
-
-                if (ENC_CALIB_DIR_FORCE != 0)
-                {
-                    /* 调试：手动强制方向，跳过自动判据（仍照常打印 dmech 供对照） */
-                    handle->enc_calib.suspect = 0u;
-                    dir = (ENC_CALIB_DIR_FORCE < 0) ? (int8_t)-1 : (int8_t)1;
-                }
-                else if (admech < (ENC_CALIB_DIR_MIN_RATIO * expect) ||
-                         admech > (ENC_CALIB_DIR_MAX_RATIO * expect))
-                {
-                    /* 转子没走到第二点（被齿槽/摩擦卡住）或跳到远处平衡点：
-                       位移符号不足以判方向 → 按常规方向 +1 兜底并置 suspect，
-                       主循环把结果打印出来供人工确认（多为锁轴电压不足/机械卡死） */
-                    handle->enc_calib.suspect = 1u;
-                    dir = 1;
-                }
-                else
-                {
-                    handle->enc_calib.suspect = 0u;
-                    dir = (dm >= 0.0f) ? (int8_t)1 : (int8_t)-1;
-                }
-
-                /* θmech0 处真实电角度 = 0 → offset = −dir×pp×θmech0（归一到 [0, 2π)） */
-                off = Foc_NormRad(-(float)dir * (float)MOTOR_POLE_PAIRS * handle->enc_calib.mech0);
-
-                PosSensor_SetElecDir(&handle->device.pos, dir);       /* 方向必须先于偏移生效 */
-                PosSensor_SetElecOffset(&handle->device.pos, off);
-
-                handle->enc_calib_done = 1u;
-                handle->calib_report   = 1u;                          /* 主循环一次性打印校准结果 */
-                handle->enc_calib.phase = ENC_CALIB_PHASE_FINISH;
-            }
-        }
-        break;
-
-    case ENC_CALIB_PHASE_FINISH:    /* ---- 收尾：关断回停止 ---- */
-        /* 校准结果（偏移 + 方向）只保存在 RAM 里，每次上电重新校准：
-           掉电保持（Flash 存取）属于后续开发内容，此处不再触发落盘 */
-        MotorPwm_Stop(&handle->device.pwm);     /* 关断回停止 */
-        /* 只复位过程量，便于再次校准；mech0/dmech/suspect 保留给主循环的一次性校准打印
-           （下次校准点 0/点 1 会重新写入，不会串上一次的结果）
-           unwrapped/first/last 也是过程量：下一段锁轴的首拍（tick==0）会重新播种 */
-        handle->enc_calib.phase     = ENC_CALIB_PHASE_LOCK;
-        handle->enc_calib.tick      = 0u;
-        handle->enc_calib.n         = 0u;
-        handle->enc_calib.sum       = 0.0f;
-        handle->enc_calib.point     = 0u;
-        handle->enc_calib.unwrapped = 0.0f;
-        handle->enc_calib.first     = 0.0f;
-        handle->enc_calib.last      = 0.0f;
+    /* ---- 编码器数据失效（连续 >20ms 收不到有效帧）：没有位置反馈，校准不可能成功 ----
+       直接中止，别白跑 6 秒再报一个误导性的 slip。
+       典型根因：MISO(PC11) 断线/虚焊、SCK(PC10)/CSN(PA15) 接触不良；
+       也可能是收到了恒为 0 的帧（全 0 帧会让 CRC-6 误判通过，BSP 已显式拒绝）。 */
+    if (PosSensor_IsStale(&handle->device.pos) != 0u)
+    {
+        EncCalib_Abort(&handle->enc_calib, ENC_FAIL_ENC);
+        handle->calib_report = 1u;
+        MotorPwm_Stop(&handle->device.pwm);
         handle->mode = MODE_STOP;
-        break;
-
-    default:
-        break;
+        return;
     }
+
+    if (EncCalib_Run(&handle->enc_calib, &g_enc_calib_cfg,
+                     PosSensor_GetMechAngle(&handle->device.pos),
+                     1.0f / (float)CONTROL_HIGH_HZ, &out) != 0u)
+    {
+        /* 校准完成：写回结果 → 关断 → 上报 → 回停止。
+           结果（offset + dir）只保存在 RAM 里、每次上电重新校准（掉电保持 = 后续开发内容）；
+           SUSPECT 与否在 handle->enc_calib.suspect 里，主循环打印时一并给出 */
+        PosSensor_SetElecDir(&handle->device.pos, handle->enc_calib.out_dir);
+        PosSensor_SetElecOffset(&handle->device.pos, handle->enc_calib.out_offset);
+
+        handle->enc_calib_done = 1u;
+        handle->calib_report   = 1u;            /* 主循环一次性打印 CAL 行（见 user.c） */
+        handle->drv_fault_ticks = 0u;           /* 校准成功：驱动器故障等待预算清零 */
+        handle->drv_fault_seen  = 0u;           /* （drv_fault_cnt 保留：这一轮犯过几次病要看得见） */
+
+        MotorPwm_Stop(&handle->device.pwm);
+        handle->mode = MODE_STOP;
+        return;                                 /* 本拍不要再施加电压 */
+    }
+
+    MotorPwm_EnsureEnabled(&handle->device.pwm);        /* 从停止切入：一次性使能 */
+    MC_SVPWM_Calc(out.ud, out.uq, out.sin, out.cos, &u, &v, &w);
+    MotorPwm_SetDuty(&handle->device.pwm, u, v, w);
 }
 
 /**
@@ -411,6 +348,18 @@ static void Mode_CurrentLoop(MC_Handle_t *handle)
        （中频环 10kHz 解算，fc≈95Hz）× 2π × 极对数给出；前馈与角度延迟补偿都用它 */
     float we = PosSensor_GetElecSpeed(&handle->device.pos);
 
+    /* ---- 编码器新鲜度看门狗（安全兜底）----
+       数据冻结时（连续 >20ms 没有新的有效帧，见 PosSensor_IsStale）：角度不再更新
+       ⇒ 磁场不会旋转 ⇒ **有电流、没转矩**（这就是"电机不转但一直有功率"的机理）。
+       宁可不出力：把给定归零（编码器一恢复就自动接着跑），至少不让电流白灌、不发烫。
+       ⚠ 这是**事后兜底**：真正该查的是链路本身（SSI 帧为何断），诊断信息见
+         CAL 行的 emax= 与 user.c 里那条一次性 FAULT: encoder stale */
+    if (PosSensor_IsStale(&handle->device.pos) != 0u)
+    {
+        handle->state.id_ref = 0.0f;
+        handle->state.iq_ref = 0.0f;
+    }
+
     Foc_GetSinCos(handle, we, &s, &c);      /* 含角度延迟前推补偿 */
 
     /* Clarke + Park（编码器电角度）→ state.id / state.iq 反馈 */
@@ -504,8 +453,8 @@ void Control_Init(MC_Handle_t *handle)
     handle->sched.mid_cnt = 0u;
     handle->sched.low_cnt = 0u;
 
-    /* 编码器校准状态机：初始化为第一个锁轴点（进入校准模式即从锁轴开始） */
-    EncCalib_Reset(handle);
+    /* 编码器校准状态机：复位到整段最开头（进入校准模式即从锁轴/升速开始） */
+    EncCalib_Reset(&handle->enc_calib);
 
     /* 编码器校准偏移 + 方向：当前每次上电都重新执行编码器校准，
        不读非易失存储恢复、不落盘（掉电保持 = 后续开发内容）。
@@ -517,6 +466,9 @@ void Control_Init(MC_Handle_t *handle)
     handle->oc_latched     = 0u;    /* 过流锁定：上电清零 */
     handle->fault_report   = 0u;
     handle->oc_cnt         = 0u;
+    handle->drv_fault_ticks = 0u;   /* 驱动器故障计时/计数：上电清零 */
+    handle->drv_fault_cnt   = 0u;
+    handle->drv_fault_seen  = 0u;
 
     /* 电流环：增益由电气参数 + 目标带宽算（推导见 control.h / mc_current.h），
        量出真实 R/L 后改宏即可；运行中也能直接改 mc.current.kp/ki 现场试 */

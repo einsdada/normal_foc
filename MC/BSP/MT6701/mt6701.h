@@ -50,6 +50,16 @@ typedef struct {
 void    MT6701_Ssi_Init(void);
 uint8_t MT6701_Ssi_Process_RawData(Encoder_RawData_t *data);
 
+/**
+ * @brief  取走"刚收到一帧**新**的有效帧"标志（读后清零）
+ * @retval 1 = 上次调用之后确实来了一帧新的（CRC 通过）；0 = 没有新帧（角度读数冻结中）
+ * @note   Process_RawData 是"返回最近一次有效帧"，无法区分"新帧"与"卡住的旧帧"；
+ *         设备层（pos_sensor）用本函数统计帧新鲜度，进而识别
+ *         "编码器数据冻结"——这是"电机不转但一直有电流"的常见根因：
+ *         角度不更新 ⇒ 磁场不转 ⇒ 无转矩，而电流环照常灌电流
+ */
+uint8_t MT6701_Ssi_TakeNewFrame(void);
+
 /* ============ ABZ 接口（实现：mt6701_abz.c） ============ */
 void    MT6701_Abz_Init(void);
 int32_t MT6701_Abz_GetCount(void);
